@@ -7,33 +7,16 @@ Jinwei Gu and Zhile Ren
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.autograd import Variable
 import os
 os.environ['PYTHON_EGG_CACHE'] = 'tmp/' # a writable directory 
 import numpy as np
-import pdb
-import time
 
 
 
 
-__all__ = [
-    'pwc_dc_net', 'pwc_dc_net_old', 'pwcnet'
-    ]
 
-def pwcnet(data=None):
-    """FlowNetS model architecture from the
-    "Learning Optical Flow with Convolutional Networks" paper (https://arxiv.org/abs/1504.06852)
-
-    Args:
-        data : pretrained weights of the network. will create a new one if not set
-    """
-    model = PWCDCNet()
-    if data is not None:
-        model.load_state_dict(data['state_dict'])
-    return model
-
+__all__ = ['pwcnet']
 
 def conv(in_planes, out_planes, kernel_size=3, stride=1, padding=1, dilation=1):   
     return nn.Sequential(
@@ -49,49 +32,18 @@ def deconv(in_planes, out_planes, kernel_size=4, stride=2, padding=1):
 
 
 
-class WarpModule(nn.Module):
-    def __init__(self, size):
-        super(WarpModule, self).__init__()
-        B,W,H = size
-        # mesh grid 
-        xx = torch.arange(0, W).view(1,-1).repeat(H,1)
-        yy = torch.arange(0, H).view(-1,1).repeat(1,W)
-        xx = xx.view(1,1,H,W).repeat(B,1,1,1)
-        yy = yy.view(1,1,H,W).repeat(B,1,1,1)
-        self.register_buffer('grid',torch.cat((xx,yy),1).float())
-
-    def forward(self, x, flo):
-        """
-        warp an image/tensor (im2) back to im1, according to the optical flow
-
-        x: [B, C, H, W] (im2)
-        flo: [B, 2, H, W] flow
-
-        """
-        B, C, H, W = x.size()
-        vgrid = self.grid + flo
-
-        # scale grid to [-1,1] 
-        vgrid[:,0,:,:] = 2.0*vgrid[:,0,:,:]/max(W-1,1)-1.0
-        vgrid[:,1,:,:] = 2.0*vgrid[:,1,:,:]/max(H-1,1)-1.0
-
-        vgrid = vgrid.permute(0,2,3,1)        
-        output = nn.functional.grid_sample(x, vgrid)
-        mask = ((vgrid[:,:,:,0].abs()<1) * (vgrid[:,:,:,1].abs()<1)) >0
-        return output*mask.unsqueeze(1).float()
-
-
 class PWCDCNet(nn.Module):
     """
     PWC-DC net. add dilation convolution and densenet connections
 
     """
-    def __init__(self, size, md=4):
+    def __init__(self, md=4):
         """
         input: md --- maximum displacement (for correlation. default: 4), after warpping
 
         """
         super(PWCDCNet,self).__init__()
+
         self.conv1a  = conv(3,   16, kernel_size=3, stride=2)
         self.conv1aa = conv(16,  16, kernel_size=3, stride=1)
         self.conv1b  = conv(16,  16, kernel_size=3, stride=1)
@@ -111,14 +63,12 @@ class PWCDCNet(nn.Module):
         self.conv6a  = conv(196,196, kernel_size=3, stride=1)
         self.conv6b  = conv(196,196, kernel_size=3, stride=1)
 
-        self.warp5 = WarpModule([size[0],size[1]//32,size[2]//32])
-        self.warp4 = WarpModule([size[0],size[1]//16,size[2]//16])
-        self.warp3 = WarpModule([size[0],size[1]//8,size[2]//8])
-        self.warp2 = WarpModule([size[0],size[1]//4,size[2]//4])
+        self.corr    = Correlation(pad_size=md, kernel_size=1, max_displacement=md, stride1=1, stride2=1, corr_multiply=1)
         self.leakyRELU = nn.LeakyReLU(0.1)
         
         nd = (2*md+1)**2
-        dd = np.cumsum([128,128,96,64,32])
+        dd = np.cumsum([128,128,96,64,32],dtype=np.int32).astype(np.int)
+        dd = [int(d) for d in dd]
 
         od = nd
         self.conv6_0 = conv(od,      128, kernel_size=3, stride=1)
@@ -183,10 +133,6 @@ class PWCDCNet(nn.Module):
                 if m.bias is not None:
                     m.bias.data.zero_()
 
-        # load weights
-        #pretrained_dict = torch.load('/data/gengshay/PWC-Net//PyTorch/pwc_net_chairs.pth.tar')
-        #pretrained_dict['state_dict'] =  {k:v for k,v in pretrained_dict.items() if 'grid' not in k and 'flow_reg' not in k}
-        #self.load_state_dict(pretrained_dict['state_dict'],strict=False)
 
     def corr(self, refimg_fea, targetimg_fea):
         maxdisp=4
@@ -199,30 +145,67 @@ class PWCDCNet(nn.Module):
         cost = cost.view(b, ph * pw, h, w)/refimg_fea.size(1)
         return cost
 
-    def weight_parameters(self):
-        return [param for name, param in self.named_parameters() if 'weight' in name]
+    def warp(self, x, flo):
+        """
+        warp an image/tensor (im2) back to im1, according to the optical flow
 
-    def bias_parameters(self):
-        return [param for name, param in self.named_parameters() if 'bias' in name]
+        x: [B, C, H, W] (im2)
+        flo: [B, 2, H, W] flow
 
-    #@profile
-    def forward(self,im):
-        bs = im.shape[0]//2
-        c01 = self.conv1b(self.conv1aa(self.conv1a(im)))
-        c02 = self.conv2b(self.conv2aa(self.conv2a(c01)))
-        c03 = self.conv3b(self.conv3aa(self.conv3a(c02)))
-        c04 = self.conv4b(self.conv4aa(self.conv4a(c03)))
-        c05 = self.conv5b(self.conv5aa(self.conv5a(c04)))
-        c06 = self.conv6b(self.conv6a(self.conv6aa(c05)))
-        c11 = c01[:bs];  c21 = c01[bs:]
-        c12 = c02[:bs];  c22 = c02[bs:]
-        c13 = c03[:bs];  c23 = c03[bs:]
-        c14 = c04[:bs];  c24 = c04[bs:]
-        c15 = c05[:bs];  c25 = c05[bs:]
-        c16 = c06[:bs];  c26 = c06[bs:]
+        """
+        B, C, H, W = x.size()
+        # mesh grid 
+        xx = torch.arange(0, W).view(1,-1).repeat(H,1)
+        yy = torch.arange(0, H).view(-1,1).repeat(1,W)
+        xx = xx.view(1,1,H,W).repeat(B,1,1,1)
+        yy = yy.view(1,1,H,W).repeat(B,1,1,1)
+        grid = torch.cat((xx,yy),1).float()
+
+        if x.is_cuda:
+            grid = grid.cuda()
+        vgrid = Variable(grid) + flo
+
+        # scale grid to [-1,1] 
+        vgrid[:,0,:,:] = 2.0*vgrid[:,0,:,:]/max(W-1,1)-1.0
+        vgrid[:,1,:,:] = 2.0*vgrid[:,1,:,:]/max(H-1,1)-1.0
+
+        vgrid = vgrid.permute(0,2,3,1)        
+        output = nn.functional.grid_sample(x, vgrid)
+        mask = torch.autograd.Variable(torch.ones(x.size())).cuda()
+        mask = nn.functional.grid_sample(mask, vgrid)
+
+        # if W==128:
+            # np.save('mask.npy', mask.cpu().data.numpy())
+            # np.save('warp.npy', output.cpu().data.numpy())
+        
+        mask[mask<0.9999] = 0
+        mask[mask>0] = 1
+        
+        return output*mask
+
+
+    def forward(self,x):
+        im1 = x[:,:3,:,:]
+        im2 = x[:,3:,:,:]
+        
+        c11 = self.conv1b(self.conv1aa(self.conv1a(im1)))
+        c21 = self.conv1b(self.conv1aa(self.conv1a(im2)))
+        c12 = self.conv2b(self.conv2aa(self.conv2a(c11)))
+        c22 = self.conv2b(self.conv2aa(self.conv2a(c21)))
+        c13 = self.conv3b(self.conv3aa(self.conv3a(c12)))
+        c23 = self.conv3b(self.conv3aa(self.conv3a(c22)))
+        c14 = self.conv4b(self.conv4aa(self.conv4a(c13)))
+        c24 = self.conv4b(self.conv4aa(self.conv4a(c23)))
+        c15 = self.conv5b(self.conv5aa(self.conv5a(c14)))
+        c25 = self.conv5b(self.conv5aa(self.conv5a(c24)))
+        c16 = self.conv6b(self.conv6a(self.conv6aa(c15)))
+        c26 = self.conv6b(self.conv6a(self.conv6aa(c25)))
+
 
         corr6 = self.corr(c16, c26) 
         corr6 = self.leakyRELU(corr6)   
+
+
         x = torch.cat((self.conv6_0(corr6), corr6),1)
         x = torch.cat((self.conv6_1(x), x),1)
         x = torch.cat((self.conv6_2(x), x),1)
@@ -233,7 +216,7 @@ class PWCDCNet(nn.Module):
         up_feat6 = self.upfeat6(x)
 
         
-        warp5 = self.warp5(c25, up_flow6*0.625)
+        warp5 = self.warp(c25, up_flow6*0.625)
         corr5 = self.corr(c15, warp5) 
         corr5 = self.leakyRELU(corr5)
         x = torch.cat((corr5, c15, up_flow6, up_feat6), 1)
@@ -247,7 +230,7 @@ class PWCDCNet(nn.Module):
         up_feat5 = self.upfeat5(x)
 
        
-        warp4 = self.warp4(c24, up_flow5*1.25)
+        warp4 = self.warp(c24, up_flow5*1.25)
         corr4 = self.corr(c14, warp4)  
         corr4 = self.leakyRELU(corr4)
         x = torch.cat((corr4, c14, up_flow5, up_feat5), 1)
@@ -261,9 +244,11 @@ class PWCDCNet(nn.Module):
         up_feat4 = self.upfeat4(x)
 
 
-        warp3 = self.warp3(c23, up_flow4*2.5)
+        warp3 = self.warp(c23, up_flow4*2.5)
         corr3 = self.corr(c13, warp3) 
         corr3 = self.leakyRELU(corr3)
+        
+
         x = torch.cat((corr3, c13, up_flow4, up_feat4), 1)
         x = torch.cat((self.conv3_0(x), x),1)
         x = torch.cat((self.conv3_1(x), x),1)
@@ -275,7 +260,7 @@ class PWCDCNet(nn.Module):
         up_feat3 = self.upfeat3(x)
 
 
-        warp2 = self.warp2(c22, up_flow3*5.0) 
+        warp2 = self.warp(c22, up_flow3*5.0) 
         corr2 = self.corr(c12, warp2)
         corr2 = self.leakyRELU(corr2)
         x = torch.cat((corr2, c12, up_flow3, up_feat3), 1)
@@ -285,18 +270,23 @@ class PWCDCNet(nn.Module):
         x = torch.cat((self.conv2_3(x), x),1)
         x = torch.cat((self.conv2_4(x), x),1)
         flow2 = self.predict_flow2(x)
-
-
+ 
         x = self.dc_conv4(self.dc_conv3(self.dc_conv2(self.dc_conv1(x))))
         flow2 += self.dc_conv7(self.dc_conv6(self.dc_conv5(x)))
-
-        flow2 = F.upsample(flow2, [im.size()[2],im.size()[3]], mode='bilinear')
         
         if self.training:
-            flow3 = F.upsample(flow3, [im.size()[2],im.size()[3]], mode='bilinear')
-            flow4 = F.upsample(flow4, [im.size()[2],im.size()[3]], mode='bilinear')
-            flow5 = F.upsample(flow5, [im.size()[2],im.size()[3]], mode='bilinear')
-            flow6 = F.upsample(flow6, [im.size()[2],im.size()[3]], mode='bilinear')
             return flow2,flow3,flow4,flow5,flow6
         else:
             return flow2
+
+
+def pwcnet(path=None):
+
+    model = PWCDCNet()
+    if path is not None:
+        data = torch.load(path)
+        if 'state_dict' in data.keys():
+            model.load_state_dict(data['state_dict'])
+        else:
+            model.load_state_dict(data)
+    return model
